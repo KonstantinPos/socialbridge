@@ -10,8 +10,8 @@ import org.springframework.web.client.RestClient
 
 @Component
 class VkClient(
-    @Value("\${vk.access-token}") private val groupToken: String,       // для wall.post
-    @Value("\${vk.user-access-token:}") private val userToken: String,  // для photos.*
+    @Value("\${vk.access-token}") private val groupToken: String,
+    @Value("\${vk.user-access-token:}") private val userToken: String,
     @Value("\${vk.group-id}") private val groupId: Long,
     @Value("\${vk.api-version}") private val apiVersion: String
 ) {
@@ -31,13 +31,11 @@ class VkClient(
         resp?.error?.let { throw IllegalStateException("VK error ${it.error_code}: ${it.error_msg}") }
     }
 
-    /** Текст + НАТИВНОЕ фото (без ссылок/фолбэков). */
     fun postTextWithPhotoOrThrow(message: String?, imageBytes: ByteArray, fileName: String = "photo.jpg") {
         require(userToken.isNotBlank()) {
             "vk.user-access-token is empty; photos.* require a valid USER token"
         }
 
-        // 1) upload_url (userToken)
         val uploadServer = api.get().uri { b ->
             b.path("/photos.getWallUploadServer")
                 .queryParam("group_id", groupId)
@@ -50,7 +48,6 @@ class VkClient(
         val uploadUrl = (uploadServer.response?.get("upload_url") as? String)
             ?: error("No upload_url returned")
 
-        // 2) multipart/form-data на upload_url
         val resource = object : ByteArrayResource(imageBytes) {
             override fun getFilename(): String = fileName
             override fun contentLength(): Long = imageBytes.size.toLong()
@@ -66,11 +63,9 @@ class VkClient(
             .body(VkUploadResult::class.java)
             ?: error("Empty upload result")
 
-        // 3) Сохраняем фото — ВАЖНО: делаем POST с form-urlencoded,
-        //    чтобы JSON из поля `photo` корректно закодировался.
         val form: MultiValueMap<String, String> = LinkedMultiValueMap<String, String>().apply {
             add("group_id", groupId.toString())
-            add("photo", uploadResult.photo)           // это JSON-строка от шага 2
+            add("photo", uploadResult.photo)
             add("server", uploadResult.server.toString())
             add("hash", uploadResult.hash)
             add("access_token", userToken)
@@ -86,9 +81,8 @@ class VkClient(
         saved.error?.let { throw IllegalStateException("VK error ${it.error_code}: ${it.error_msg}") }
 
         val ph = saved.response?.firstOrNull() ?: error("No photo in saveWallPhoto response")
-        val attachment = "photo${ph.owner_id}_${ph.id}" // owner_id для группы будет отрицательным
+        val attachment = "photo${ph.owner_id}_${ph.id}"
 
-        // 4) публикация (groupToken)
         val resp = api.get().uri { b ->
             b.path("/wall.post")
                 .queryParam("owner_id", -groupId)
@@ -104,7 +98,6 @@ class VkClient(
     }
 }
 
-/* DTO */
 data class VkResponse(val response: Any? = null, val error: VkError? = null)
 data class VkError(val error_code: Int, val error_msg: String)
 data class VkUploadServerResponse(val response: Map<String, Any>? = null, val error: VkError? = null)

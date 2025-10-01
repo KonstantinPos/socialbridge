@@ -15,7 +15,17 @@ data class TgMessage(
     val chat: TgChat,
     val text: String? = null,
     val caption: String? = null,
-    val photo: List<TgPhotoSize>? = null
+    val photo: List<TgPhotoSize>? = null,
+
+    val entities: List<TgMessageEntity>? = null,
+    @JsonProperty("caption_entities") val captionEntities: List<TgMessageEntity>? = null
+)
+
+data class TgMessageEntity(
+    val type: String,
+    val offset: Int,
+    val length: Int,
+    val url: String? = null
 )
 
 data class TgChat(val id: Long, val type: String)

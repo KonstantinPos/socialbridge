@@ -3,13 +3,15 @@ spring:
    name: post-relay
 
 telegram:
-  bot-token: 8045124441:AAEyb5KKEw9UKD7UwprZX-1mWST5NmTbl48
-  source-chat-id: -1003162514413   # id ?????? ??????/??????
-  polling-interval-ms: 5000        # ???????? ??????
-  timeout-sec: 25                  # ??????? long polling ???????
+  bot-token:
+  source-chat-ids: -1003162514413, -1002656029749
+#  source-chat-id: -1003162514413   # id айди тестового канала
+#  source-chat-id: -1002656029749  # id айди канала по скидкам
+  polling-interval-ms: 5000
+  timeout-sec: 25
 
 vk:
-  access-token: vk1.a.Cn-0mp7Ql-kbK3FAk-O70tMVH3P_sRdJd5Q-MNh6d_5wppAIUNdM43RnjTjrg9uH70A7izeZYvaBeIqpEy5WJRaJ_vzg4QOI1iudsbu3C7b_C9G5fqm8KOZd-RNvcoEshRB_i92ARbf_fB_hBBuT34Apra9R6YoMRau3TgmhcP_t85O88qCIwbeoIkJUhF73yPDAu4Df7KJbePjWGaRzMA
-  user-access-token: vk1.a.A0wonlGD0B2EVXst-cB64gzM68X_6JTQRXBp1NHs85b2jeyJu6ncTT8fG1agToOwSyJWQUk4QCOaA5bI_C2CZCB2J2T8o_6T5Ob02_al8CaaTbxkJcY-KCiBVJTh6w6FTvLGLBxMegZOKYiYLy4F3_An14Hnj2p2RZaCC6UifS73HPuhDMIXQkEFJr3Y3PNa92GUjIMmj1MWlG3Wt43HGA
-  group-id: 229831803              # id ?????????? VK (??? ??????)
+  access-token:
+  user-access-token:
+  group-id: 229831803
   api-version: "5.199"

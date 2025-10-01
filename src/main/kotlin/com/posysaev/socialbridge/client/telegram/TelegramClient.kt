@@ -19,8 +19,8 @@ class TelegramClient(
         .baseUrl("https://api.telegram.org")
         .build()
 
-    fun getUpdates(offset: Long?, timeoutSec: Int): TgUpdatesResponse =
-        api.get()
+    fun getUpdates(offset: Long?, timeoutSec: Int): TgUpdatesResponse {
+        val response = api.get()
             .uri { b ->
                 b.path("/getUpdates")
                     .queryParam("allowed_updates", "message,channel_post")
@@ -30,6 +30,10 @@ class TelegramClient(
             }
             .retrieve()
             .body(TgUpdatesResponse::class.java) ?: TgUpdatesResponse(false, emptyList())
+
+        return response
+    }
+
 
     fun getFile(fileId: String): TgFileResponse =
         api.get()
