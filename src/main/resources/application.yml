@@ -1,12 +1,11 @@
 spring:
   application:
-   name: post-relay
-
+    name: post-relay
+server:
+  port: 8081
 telegram:
   bot-token:
   source-chat-ids: -1003162514413, -1002656029749
-#  source-chat-id: -1003162514413   # id айди тестового канала
-#  source-chat-id: -1002656029749  # id айди канала по скидкам
   polling-interval-ms: 5000
   timeout-sec: 25
 
@@ -15,3 +14,9 @@ vk:
   user-access-token:
   group-id: 229831803
   api-version: "5.199"
+
+logging:
+  level:
+    com:
+      posysaev:
+        socialbridge: DEBUG
