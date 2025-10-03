@@ -2,10 +2,10 @@ package com.posysaev.socialbridge.service
 
 import com.posysaev.socialbridge.client.telegram.TelegramClient
 import com.posysaev.socialbridge.client.vkontakte.VkClient
-import com.posysaev.socialbridge.dto.telegram.TgMessage
+import com.posysaev.socialbridge.config.TelegramProperties
 import com.posysaev.socialbridge.dto.telegram.TgMessageEntity
+import com.posysaev.socialbridge.dto.telegram.TgUpdate
 import org.slf4j.LoggerFactory
-import org.springframework.beans.factory.annotation.Value
 import org.springframework.scheduling.annotation.EnableScheduling
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Service
@@ -17,12 +17,11 @@ import kotlin.math.max
 class PollingService(
     private val tg: TelegramClient,
     private val vk: VkClient,
-    @Value("\${telegram.source-chat-ids}") private val sourceChatIds: Set<Long>,
-    @Value("\${telegram.timeout-sec:25}") private val timeoutSec: Int
+    private val tgProps: TelegramProperties
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
     private val lastUpdateId = AtomicLong(0L)
-    private val processedMessages = mutableSetOf<String>() // Для защиты от дубликатов
+    private val processedMessages = mutableSetOf<String>() // защита от дубликатов
 
     @Scheduled(fixedDelayString = "\${telegram.polling-interval-ms:5000}")
     fun poll() {
@@ -32,7 +31,7 @@ class PollingService(
         try {
             val updates = tg.getUpdates(
                 if (currentOffset == 0L) null else currentOffset + 1,
-                timeoutSec
+                tgProps.timeoutSec
             )
 
             if (!updates.ok) {
@@ -45,12 +44,14 @@ class PollingService(
             updates.result.forEach { upd ->
                 try {
                     processUpdate(upd)
-                    // Обновляем offset только после успешной обработки
+                    // offset двигаем только после успешной обработки
                     lastUpdateId.updateAndGet { current -> max(current, upd.updateId) }
                 } catch (e: Exception) {
-                    log.error("Failed to process update {} - SKIPPING and moving offset forward to avoid stuck",
-                        upd.updateId, e)
-                    // ВАЖНО: всё равно обновляем offset, чтобы не застрять на проблемном update
+                    log.error(
+                        "Failed to process update {} - SKIPPING and moving offset forward",
+                        upd.updateId, e
+                    )
+                    // ВАЖНО: всё равно обновляем offset, чтобы не застрять
                     lastUpdateId.updateAndGet { current -> max(current, upd.updateId) }
                 }
             }
@@ -59,11 +60,11 @@ class PollingService(
 
         } catch (e: Exception) {
             log.error("Polling failed at offset ${lastUpdateId.get()}", e)
-            // НЕ пробрасываем исключение дальше - даём Spring попробовать снова
+            // исключение не пробрасываем — Spring попробует снова
         }
     }
 
-    private fun processUpdate(upd: com.posysaev.socialbridge.dto.telegram.TgUpdate) {
+    private fun processUpdate(upd: TgUpdate) {
         val msg = upd.channelPost ?: upd.message
         if (msg == null) {
             log.debug("Skip update {} (no message/channelPost)", upd.updateId)
@@ -72,32 +73,40 @@ class PollingService(
 
         val messageKey = "${msg.chat.id}:${msg.messageId}"
 
-        log.info("Processing update {} | chatId={} | messageId={} | chatType={}",
-            upd.updateId, msg.chat.id, msg.messageId, msg.chat.type)
+        log.info(
+            "Processing update {} | chatId={} | messageId={} | chatType={}",
+            upd.updateId, msg.chat.id, msg.messageId, msg.chat.type
+        )
 
-        // Проверка дубликата
+        // Проверка дубликатов
         if (processedMessages.contains(messageKey)) {
             log.warn("DUPLICATE detected! Already processed message: {}", messageKey)
             return
         }
 
         // Проверка источника
-        if (msg.chat.id !in sourceChatIds) {
-            log.debug("Skip: chatId {} not in sourceChatIds {}", msg.chat.id, sourceChatIds)
+        if (msg.chat.id !in tgProps.sourceChatIds) {
+            log.debug("Skip: chatId {} not in sourceChatIds {}", msg.chat.id, tgProps.sourceChatIds)
             return
         }
 
         val (rawText, ents) = when {
-            msg.text != null    -> {
-                log.debug("Message has text: {} chars, {} entities",
-                    msg.text.length, msg.entities?.size ?: 0)
+            msg.text != null -> {
+                log.debug(
+                    "Message has text: {} chars, {} entities",
+                    msg.text.length, msg.entities?.size ?: 0
+                )
                 msg.text to (msg.entities ?: emptyList())
             }
+
             msg.caption != null -> {
-                log.debug("Message has caption: {} chars, {} entities",
-                    msg.caption.length, msg.captionEntities?.size ?: 0)
+                log.debug(
+                    "Message has caption: {} chars, {} entities",
+                    msg.caption.length, msg.captionEntities?.size ?: 0
+                )
                 msg.caption to (msg.captionEntities ?: emptyList())
             }
+
             else -> null to emptyList()
         }
 
@@ -108,8 +117,10 @@ class PollingService(
 
         try {
             if (photo != null) {
-                log.info("Posting photo to VK | fileId={} | size={}x{}",
-                    photo.fileId, photo.width, photo.height)
+                log.info(
+                    "Posting photo to VK | fileId={} | size={}x{}",
+                    photo.fileId, photo.width, photo.height
+                )
 
                 val fileInfo = tg.getFile(photo.fileId)
                 val path = fileInfo.result.filePath
@@ -126,16 +137,20 @@ class PollingService(
                 val fileName = path.substringAfterLast('/')
                 log.debug("Uploading to VK with fileName={}", fileName)
 
-                vk.postTextWithPhotoOrThrow(text, bytes, fileName = fileName)
+                vk.postTextWithPhoto(text, bytes, fileName)
 
-                log.info("✓ VK: posted photo | chatId={} | messageId={} | size={} bytes",
-                    msg.chat.id, msg.messageId, bytes.size)
+                log.info(
+                    "✓ VK: posted photo | chatId={} | messageId={} | size={} bytes",
+                    msg.chat.id, msg.messageId, bytes.size
+                )
 
             } else if (!text.isNullOrBlank()) {
                 log.info("Posting text to VK | length={}", text.length)
                 vk.postText(text)
-                log.info("✓ VK: posted text | chatId={} | messageId={}",
-                    msg.chat.id, msg.messageId)
+                log.info(
+                    "✓ VK: posted text | chatId={} | messageId={}",
+                    msg.chat.id, msg.messageId
+                )
 
             } else {
                 log.info("Skip update {} (no text/photo)", upd.updateId)
@@ -145,7 +160,7 @@ class PollingService(
             // Добавляем в обработанные ТОЛЬКО после успешной отправки
             processedMessages.add(messageKey)
 
-            // Ограничиваем размер множества (храним последние 1000)
+            // ограничиваем кеш последних сообщений (1000)
             if (processedMessages.size > 1000) {
                 val toRemove = processedMessages.take(processedMessages.size - 1000)
                 processedMessages.removeAll(toRemove.toSet())
@@ -153,8 +168,10 @@ class PollingService(
             }
 
         } catch (e: Exception) {
-            log.error("Failed to post to VK | chatId={} | messageId={} | error={}",
-                msg.chat.id, msg.messageId, e.message, e)
+            log.error(
+                "Failed to post to VK | chatId={} | messageId={} | error={}",
+                msg.chat.id, msg.messageId, e.message, e
+            )
             throw e
         }
     }
