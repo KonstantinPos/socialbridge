@@ -5,11 +5,8 @@ import org.springframework.stereotype.Component
 
 @Component
 class MaxClient : MessengerClient {
-    override fun postText(message: String) {
-        // TODO: реализовать интеграцию с MAX
+    override fun postToWall(message: String?, photos: List<Pair<ByteArray, String>>) {
+        TODO("Not yet implemented")
     }
 
-    override fun postTextWithPhoto(message: String?, imageBytes: ByteArray, fileName: String) {
-        // TODO: реализовать интеграцию с MAX
-    }
 }

@@ -53,7 +53,9 @@ data class TgMessage(
 
     /** Энтити в подписи */
     @JsonProperty("caption_entities")
-    val captionEntities: List<TgMessageEntity>? = null
+    val captionEntities: List<TgMessageEntity>? = null,
+
+    @JsonProperty("media_group_id") val mediaGroupId: String? = null
 )
 
 /**
@@ -122,4 +124,25 @@ data class TgFile(
     /** Путь для скачивания через /file/bot<token>/<file_path> */
     @JsonProperty("file_path")
     val filePath: String? = null
+)
+
+
+/**
+ * Временный буфер для сборки Telegram-альбома (media_group)
+ * до публикации во ВКонтакте.
+ *
+ * Когда Telegram присылает альбом из нескольких фотографий, каждое фото
+ * приходит отдельным сообщением с одинаковым [mediaGroupId].
+ * Этот класс используется для временного накопления всех частей альбома.
+ *
+ * @property chatId ID чата/канала, из которого пришло сообщение.
+ * @property startedAt Время (в мс) первой полученной части альбома — для контроля тайм-аута.
+ * @property items Список пар (fileId, caption) — все изображения альбома с подписью (если есть).
+ * @property captionEntities Сущности форматирования подписи (ссылки и т.п.), общие для альбома.
+ */
+data class AlbumBuf(
+    val chatId: Long,
+    val startedAt: Long,
+    val items: MutableList<Pair<String, String?>> = mutableListOf(),
+    var captionEntities: List<TgMessageEntity> = emptyList()
 )

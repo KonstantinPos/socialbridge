@@ -3,6 +3,7 @@ package com.posysaev.socialbridge.service
 import com.posysaev.socialbridge.client.telegram.TelegramClient
 import com.posysaev.socialbridge.client.vkontakte.VkClient
 import com.posysaev.socialbridge.config.TelegramProperties
+import com.posysaev.socialbridge.dto.telegram.AlbumBuf
 import com.posysaev.socialbridge.dto.telegram.TgMessageEntity
 import com.posysaev.socialbridge.dto.telegram.TgUpdate
 import org.slf4j.LoggerFactory
@@ -12,6 +13,17 @@ import org.springframework.stereotype.Service
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
+/**
+ * Основной сервис для периодического опроса Telegram-канала и пересылки постов во ВКонтакте.
+ *
+ * Поддерживает:
+ *  - обычные текстовые сообщения;
+ *  - сообщения с одной фотографией;
+ *  - альбомы (media_group) из нескольких фото.
+ *
+ * Альбомы из нескольких сообщений Telegram собираются во временный буфер [AlbumBuf],
+ * а затем публикуются как один пост во ВКонтакте.
+ */
 @Service
 @EnableScheduling
 class PollingService(
@@ -21,179 +33,155 @@ class PollingService(
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
     private val lastUpdateId = AtomicLong(0L)
-    private val processedMessages = mutableSetOf<String>() // защита от дубликатов
+    private val processedMessages = mutableSetOf<String>()
 
+    /** Буфер для альбомов: ключ — media_group_id, значение — временное хранилище элементов альбома */
+    private val albums = mutableMapOf<String, AlbumBuf>()
+
+    /** Время ожидания (в мс) после первой части альбома перед публикацией */
+    private val albumBufferMs = 2500L
+
+    /**
+     * Планировщик, который регулярно опрашивает Telegram API на наличие новых сообщений.
+     *
+     * @Scheduled запускает метод с указанным интервалом, заданным в настройке
+     * `telegram.polling-interval-ms` (по умолчанию 5 секунд).
+     *
+     * Каждый апдейт проверяется и обрабатывается методом [processUpdate],
+     * а после — вызывается [flushExpiredAlbums] для публикации готовых альбомов.
+     */
     @Scheduled(fixedDelayString = "\${telegram.polling-interval-ms:5000}")
     fun poll() {
         val currentOffset = lastUpdateId.get()
-        log.debug("Starting poll with offset: {}", if (currentOffset == 0L) "null" else currentOffset + 1)
-
         try {
+            // Получаем новые обновления из Telegram начиная с последнего ID
             val updates = tg.getUpdates(
                 if (currentOffset == 0L) null else currentOffset + 1,
                 tgProps.timeoutSec
             )
+            if (!updates.ok) return
 
-            if (!updates.ok) {
-                log.warn("Telegram API returned ok=false")
-                return
-            }
-
-            log.debug("Received {} updates", updates.result.size)
-
+            // Обрабатываем каждое сообщение
             updates.result.forEach { upd ->
                 try {
                     processUpdate(upd)
-                    // offset двигаем только после успешной обработки
-                    lastUpdateId.updateAndGet { current -> max(current, upd.updateId) }
+                    lastUpdateId.updateAndGet { cur -> max(cur, upd.updateId) }
                 } catch (e: Exception) {
-                    log.error(
-                        "Failed to process update {} - SKIPPING and moving offset forward",
-                        upd.updateId, e
-                    )
-                    // ВАЖНО: всё равно обновляем offset, чтобы не застрять
-                    lastUpdateId.updateAndGet { current -> max(current, upd.updateId) }
+                    log.error("Failed to process update ${upd.updateId}", e)
+                    // Даже при ошибке двигаем offset, чтобы не зациклиться
+                    lastUpdateId.updateAndGet { cur -> max(cur, upd.updateId) }
                 }
             }
 
-            log.debug("Poll completed. New offset: {}", lastUpdateId.get())
-
+            // После обработки пакета апдейтов публикуем готовые альбомы
+            flushExpiredAlbums()
         } catch (e: Exception) {
-            log.error("Polling failed at offset ${lastUpdateId.get()}", e)
-            // исключение не пробрасываем — Spring попробует снова
+            log.error("Polling failed", e)
         }
     }
 
+    /**
+     * Обработка одного обновления Telegram ([TgUpdate]).
+     *
+     * - Отбрасывает дубликаты и неразрешённые чаты.
+     * - Распознаёт тип сообщения (текст / фото / альбом).
+     * - Вызывает публикацию в VK через [VkClient].
+     */
     private fun processUpdate(upd: TgUpdate) {
-        val msg = upd.channelPost ?: upd.message
-        if (msg == null) {
-            log.debug("Skip update {} (no message/channelPost)", upd.updateId)
-            return
-        }
+        val msg = upd.channelPost ?: upd.message ?: return
 
-        val messageKey = "${msg.chat.id}:${msg.messageId}"
+        // Проверка: сообщение должно быть из разрешённого списка каналов
+        if (msg.chat.id !in tgProps.sourceChatIds) return
 
-        log.info(
-            "Processing update {} | chatId={} | messageId={} | chatType={}",
-            upd.updateId, msg.chat.id, msg.messageId, msg.chat.type
-        )
+        // Проверка на дубли (чтобы не постить одно и то же)
+        val key = "${msg.chat.id}:${msg.messageId}"
+        if (!processedMessages.add(key)) return
 
-        // Проверка дубликатов
-        if (processedMessages.contains(messageKey)) {
-            log.warn("DUPLICATE detected! Already processed message: {}", messageKey)
-            return
-        }
-
-        // Проверка источника
-        if (msg.chat.id !in tgProps.sourceChatIds) {
-            log.debug("Skip: chatId {} not in sourceChatIds {}", msg.chat.id, tgProps.sourceChatIds)
-            return
-        }
-
+        // Извлекаем текст и сущности (ссылки, форматирование)
         val (rawText, ents) = when {
-            msg.text != null -> {
-                log.debug(
-                    "Message has text: {} chars, {} entities",
-                    msg.text.length, msg.entities?.size ?: 0
-                )
-                msg.text to (msg.entities ?: emptyList())
-            }
-
-            msg.caption != null -> {
-                log.debug(
-                    "Message has caption: {} chars, {} entities",
-                    msg.caption.length, msg.captionEntities?.size ?: 0
-                )
-                msg.caption to (msg.captionEntities ?: emptyList())
-            }
-
+            msg.text != null -> msg.text to (msg.entities ?: emptyList())
+            msg.caption != null -> msg.caption to (msg.captionEntities ?: emptyList())
             else -> null to emptyList()
         }
-
         val text = expandTextLinks(rawText, ents)
-        log.debug("Expanded text: {}", text?.take(100))
 
+        // === Если это часть альбома (media_group) ===
+        msg.mediaGroupId?.let { gid ->
+            val best = msg.photo?.maxByOrNull { it.width * it.height } ?: return
+            val album = albums.getOrPut(gid) {
+                AlbumBuf(msg.chat.id, System.currentTimeMillis())
+            }
+            // добавляем фото и подпись (caption, если она есть)
+            album.items += best.fileId to (msg.caption ?: album.items.firstOrNull()?.second)
+            if (!msg.captionEntities.isNullOrEmpty()) album.captionEntities = msg.captionEntities!!
+            return // не постим сразу, ждём остальные части альбома
+        }
+
+        // === Обычное сообщение (одиночное фото или текст) ===
         val photo = msg.photo?.maxByOrNull { it.width * it.height }
-
-        try {
-            if (photo != null) {
-                log.info(
-                    "Posting photo to VK | fileId={} | size={}x{}",
-                    photo.fileId, photo.width, photo.height
-                )
-
-                val fileInfo = tg.getFile(photo.fileId)
-                val path = fileInfo.result.filePath
-
-                if (path == null) {
-                    log.warn("TG: file_path is null for fileId={}", photo.fileId)
-                    return
-                }
-
-                log.debug("Downloading file from: {}", path)
-                val bytes = tg.downloadFileBytes(path)
-                log.debug("Downloaded {} bytes", bytes.size)
-
-                val fileName = path.substringAfterLast('/')
-                log.debug("Uploading to VK with fileName={}", fileName)
-
-                vk.postTextWithPhoto(text, bytes, fileName)
-
-                log.info(
-                    "✓ VK: posted photo | chatId={} | messageId={} | size={} bytes",
-                    msg.chat.id, msg.messageId, bytes.size
-                )
-
-            } else if (!text.isNullOrBlank()) {
-                log.info("Posting text to VK | length={}", text.length)
-                vk.postText(text)
-                log.info(
-                    "✓ VK: posted text | chatId={} | messageId={}",
-                    msg.chat.id, msg.messageId
-                )
-
-            } else {
-                log.info("Skip update {} (no text/photo)", upd.updateId)
-                return
-            }
-
-            // Добавляем в обработанные ТОЛЬКО после успешной отправки
-            processedMessages.add(messageKey)
-
-            // ограничиваем кеш последних сообщений (1000)
-            if (processedMessages.size > 1000) {
-                val toRemove = processedMessages.take(processedMessages.size - 1000)
-                processedMessages.removeAll(toRemove.toSet())
-                log.debug("Cleaned processed messages cache, size now: {}", processedMessages.size)
-            }
-
-        } catch (e: Exception) {
-            log.error(
-                "Failed to post to VK | chatId={} | messageId={} | error={}",
-                msg.chat.id, msg.messageId, e.message, e
-            )
-            throw e
+        if (photo != null) {
+            // скачиваем фото и публикуем
+            val fileInfo = tg.getFile(photo.fileId)
+            val path = fileInfo.result.filePath ?: return
+            val bytes = tg.downloadFileBytes(path)
+            val fileName = path.substringAfterLast('/')
+            vk.postToWall(text, listOf(bytes to fileName))
+        } else if (!text.isNullOrBlank()) {
+            // публикуем только текст
+            vk.postToWall(text)
         }
     }
 
+    /**
+     * Проверяет, какие альбомы "созрели" (прошло больше [albumBufferMs]),
+     * и публикует их во ВКонтакте как один пост.
+     *
+     * После публикации альбом удаляется из буфера [albums].
+     */
+    private fun flushExpiredAlbums() {
+        val now = System.currentTimeMillis()
+        val ready = albums.filterValues { now - it.startedAt >= albumBufferMs }.toList()
+        ready.forEach { (groupId, buf) ->
+            try {
+                // загружаем файлы по их fileId
+                val photos = buf.items.map { (fileId, _) ->
+                    val path = tg.getFile(fileId).result.filePath ?: error("Null path for $fileId")
+                    tg.downloadFileBytes(path) to path.substringAfterLast('/')
+                }
+
+                if (photos.isNotEmpty()) {
+                    // формируем текст подписи и публикуем
+                    val caption = expandTextLinks(buf.items.firstOrNull()?.second, buf.captionEntities)
+                    vk.postToWall(caption, photos)
+                    log.info("VK: posted album {} ({} photos)", groupId, photos.size)
+                }
+            } catch (e: Exception) {
+                log.error("Failed to post album {}", groupId, e)
+            } finally {
+                // очищаем буфер альбома
+                albums.remove(groupId)
+            }
+        }
+    }
+
+    /**
+     * Преобразует Telegram-ссылки (entities с type = text_link) в "видимый текст + URL",
+     * чтобы при публикации во ВКонтакте ссылка не терялась.
+     *
+     * Пример:
+     *   Telegram:  [OpenAI](https://openai.com)
+     *   Результат: OpenAI https://openai.com
+     */
     private fun expandTextLinks(text: String?, entities: List<TgMessageEntity>?): String? {
         if (text.isNullOrEmpty() || entities.isNullOrEmpty()) return text
-
         val links = entities.filter { it.type == "text_link" && !it.url.isNullOrBlank() }
             .sortedByDescending { it.offset }
-
-        if (links.isEmpty()) return text
-
-        log.debug("Expanding {} text_link entities", links.size)
-
         val sb = StringBuilder(text)
         for (e in links) {
             val start = e.offset
             val end = (e.offset + e.length).coerceAtMost(sb.length)
             val visible = sb.substring(start, end)
-            val replacement = "$visible ${e.url}"
-            sb.replace(start, end, replacement)
-            log.trace("Expanded link: '{}' -> '{}'", visible, replacement)
+            sb.replace(start, end, "$visible ${e.url}")
         }
         return sb.toString()
     }
