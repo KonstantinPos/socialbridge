@@ -7,14 +7,14 @@ server:
 
 telegram:
   bot-token:
-  source-chat-ids:
+  source-chat-ids: -1003162514413, -1002656029749
   polling-interval-ms: 30000
   timeout-sec: 25
   base-url: "https://api.telegram.org"
 
 vk:
   user-access-token:
-  group-id:
+  group-id: 229831803
   api-version: "5.199"
   base-url: "https://api.vk.com/method"
 

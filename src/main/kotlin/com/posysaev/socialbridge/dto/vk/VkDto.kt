@@ -1,6 +1,7 @@
 package com.posysaev.socialbridge.dto.vk
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.posysaev.socialbridge.dto.telegram.TgMessageEntity
 
 /**
  * Универсальный ответ от VK API
@@ -78,3 +79,48 @@ data class VkSavedPhoto(
     @JsonProperty("owner_id")
     val ownerId: Int
 )
+
+/** Ответ video.save */
+data class VkVideoSaveResponse(
+    val response: VkVideoSaveData? = null,
+    val error: VkError? = null
+)
+
+/** Поля из video.save, которые нам нужны */
+data class VkVideoSaveData(
+    @JsonProperty("upload_url") val uploadUrl: String,
+    @JsonProperty("video_id") val videoId: Long? = null,
+    @JsonProperty("owner_id") val ownerId: Long? = null,
+    @JsonProperty("access_key") val accessKey: String? = null,
+)
+
+/** Результат заливки файла на upload_url */
+data class VkVideoUploadResult(
+    @JsonProperty("video_id") val videoId: Long,
+    @JsonProperty("owner_id") val ownerId: Long,
+    @JsonProperty("video_hash") val videoHash: String? = null,
+    val size: Long? = null,
+    @JsonProperty("direct_link") val directLink: String? = null
+)
+
+/** Универсальный тип вложений */
+sealed class VkMedia {
+    data class Photo(val bytes: ByteArray, val fileName: String) : VkMedia()
+    data class Video(val bytes: ByteArray, val fileName: String) : VkMedia()
+}
+
+
+/** Альбом, который может содержать и фото, и видео */
+data class MixedAlbum(
+    val chatId: Long,
+    val startedAt: Long,
+    var caption: String? = null,
+    var captionEntities: List<TgMessageEntity>? = null,
+    val items: MutableList<MixedMedia> = mutableListOf()
+)
+
+/** Универсальное медиа в Telegram */
+sealed class MixedMedia {
+    data class Photo(val fileId: String) : MixedMedia()
+    data class Video(val fileId: String) : MixedMedia()
+}

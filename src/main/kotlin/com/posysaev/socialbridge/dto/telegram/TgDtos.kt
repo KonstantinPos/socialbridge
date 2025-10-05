@@ -55,6 +55,9 @@ data class TgMessage(
     @JsonProperty("caption_entities")
     val captionEntities: List<TgMessageEntity>? = null,
 
+    // внутри TgMessage
+    val video: TgVideo? = null,
+
     @JsonProperty("media_group_id") val mediaGroupId: String? = null
 )
 
@@ -70,6 +73,17 @@ data class TgMessageEntity(
     val length: Int,
     /** Ссылка (если type = text_link) */
     val url: String? = null
+)
+
+/** Видео в Telegram-сообщении */
+data class TgVideo(
+    @JsonProperty("file_id") val fileId: String,
+    @JsonProperty("file_unique_id") val fileUniqueId: String,
+    val width: Int? = null,
+    val height: Int? = null,
+    val duration: Int? = null,
+    @JsonProperty("mime_type") val mimeType: String? = null,
+    @JsonProperty("file_size") val fileSize: Long? = null
 )
 
 /**
