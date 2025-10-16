@@ -71,7 +71,7 @@ class PollingService(
         msg.mediaGroupId?.let { gid ->
             val album = albums.computeIfAbsent(gid) { MixedAlbum(msg.chat.id, System.currentTimeMillis()) }
             album.caption = album.caption ?: text
-            if (!msg.captionEntities.isNullOrEmpty()) album.captionEntities = msg.captionEntities!!
+            if (!msg.captionEntities.isNullOrEmpty()) album.captionEntities = msg.captionEntities
             msg.photo?.maxByOrNull { it.width * it.height }?.let {
                 album.items += MixedMedia.Photo(it.fileId)
             }

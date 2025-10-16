@@ -22,4 +22,4 @@ logging:
   level:
     com:
       posysaev:
-        socialbridge: DEBUG
+        socialbridge: INFO

@@ -1,7 +1,6 @@
 package com.posysaev.socialbridge.config
 
 import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.web.client.RestClient
@@ -26,6 +25,12 @@ class HttpConfig(
     @Bean
     fun okHttpClient(): OkHttpClient =
         OkHttpClient.Builder()
-            .protocols(listOf(Protocol.HTTP_1_1))
+            .retryOnConnectionFailure(true)
+            .callTimeout(java.time.Duration.ofMinutes(3))
+            .connectTimeout(java.time.Duration.ofSeconds(20))
+            .readTimeout(java.time.Duration.ofMinutes(2))
+            .writeTimeout(java.time.Duration.ofMinutes(2))
+            .followRedirects(true)
             .build()
+
 }

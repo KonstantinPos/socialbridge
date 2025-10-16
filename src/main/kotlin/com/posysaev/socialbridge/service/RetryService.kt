@@ -22,7 +22,7 @@ class RetryService {
      * @param block           действие, которое ретраим
      */
     fun <T> retry(
-        times: Int = 3,
+        times: Int = 10,
         initialDelayMs: Long = 1_000,
         maxDelayMs: Long = 5_000,
         factor: Double = 2.0,

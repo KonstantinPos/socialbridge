@@ -8,9 +8,8 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
-import org.springframework.core.io.ByteArrayResource
 import org.springframework.http.MediaType
 import org.springframework.stereotype.Component
 import org.springframework.util.LinkedMultiValueMap
@@ -63,36 +62,112 @@ class VkClient(
         log.info("VK: post published (attachments: ${attachments.size})")
     }
 
-    /** Фото → photo{owner_id}_{id} */
+
     private fun uploadPhoto(bytes: ByteArray, fileName: String): String {
-        val uploadUrl = retry.retry {
-            val res = api.get().uri { b ->
+        val uploadUrl = getPhotoUploadUrl()
+
+        val firstTry = doVkPhotoUpload(uploadUrl, bytes, fileName, perCallSeconds = 90)
+
+        if (firstTry.photo.isBlank()) {
+            val info = probeImage(bytes)
+            log.warn(
+                "VK upload returned empty 'photo'. Will try RGB re-encode. " +
+                        "file={}, info={}", fileName, info
+            )
+
+            val fixedBytes = normalizeToSrgbJpeg(bytes)
+            val fixedName = ensureExt(fileName, ".jpg")
+
+            val secondTry = doVkPhotoUpload(uploadUrl, fixedBytes, fixedName, perCallSeconds = 90, attempt = "fix")
+            if (secondTry.photo.isBlank()) {
+                throw IllegalStateException(
+                    "VK upload returned empty 'photo' even after RGB re-encode; " +
+                            "server=${secondTry.server}, hash=${secondTry.hash}"
+                )
+            }
+            return saveWallPhoto(secondTry)
+        }
+
+        return saveWallPhoto(firstTry)
+    }
+
+    private fun getPhotoUploadUrl(): String {
+        val res = retry.retry {
+            api.get().uri { b ->
                 b.path("/photos.getWallUploadServer")
                     .queryParam("group_id", props.groupId)
                     .queryParam("access_token", props.userAccessToken)
                     .queryParam("v", props.apiVersion)
                     .build()
             }.retrieve().body(VkUploadServerResponse::class.java)
-            res?.error?.let { throw IllegalStateException("VK error ${it.errorCode}: ${it.errorMsg}") }
-            (res?.response?.get("upload_url") as? String) ?: error("No upload_url returned for photo")
         }
+        res?.error?.let { throw IllegalStateException("VK error ${it.errorCode}: ${it.errorMsg}") }
+        return (res?.response?.get("upload_url") as? String) ?: error("No upload_url returned for photo")
+    }
 
-        val resource = object : ByteArrayResource(bytes) {
-            override fun getFilename() = fileName
-            override fun contentLength() = bytes.size.toLong()
+    private fun doVkPhotoUpload(
+        uploadUrl: String,
+        bytes: ByteArray,
+        fileName: String,
+        perCallSeconds: Long,
+        attempt: String = "orig"
+    ): VkUploadResult {
+        val mediaType = when {
+            fileName.endsWith(".jpg", true) || fileName.endsWith(".jpeg", true) -> "image/jpeg"
+            fileName.endsWith(".png", true) -> "image/png"
+            fileName.endsWith(".gif", true) -> "image/gif"
+            else -> "application/octet-stream"
+        }.toMediaTypeOrNull()
+
+        val multipart = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("photo", fileName, bytes.toRequestBody(mediaType))
+            .build()
+
+        val request = Request.Builder().url(uploadUrl).post(multipart).build()
+
+        return retry.retry {
+            val call = httpClient.newCall(request)
+            call.timeout().timeout(perCallSeconds, java.util.concurrent.TimeUnit.SECONDS)
+
+            val host = runCatching { java.net.URI(uploadUrl).host }.getOrNull()
+            val sha1 = sha1(bytes).take(12)
+            val t0 = System.nanoTime()
+
+            call.execute().use { resp ->
+                val dtMs = (System.nanoTime() - t0) / 1_000_000
+                val raw = resp.body?.string()
+
+                log.debug(
+                    "VK uploadPhoto[{}] resp: host={}, code={}, time={}ms, ct={}, sha1={}",
+                    attempt, host, resp.code, dtMs, resp.header("Content-Type"), sha1
+                )
+
+                if (!raw.isNullOrBlank()) {
+                    log.debug(
+                        "VK uploadPhoto[{}] raw[{}]: {}", attempt, sha1,
+                        if (raw.length > 2048) raw.take(2048) + "…[truncated]" else raw
+                    )
+                } else {
+                    log.warn("VK uploadPhoto[{}] empty body [sha1={}]", attempt, sha1)
+                }
+
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException("VK photo upload failed: HTTP ${resp.code} ${resp.message}. Body: ${raw ?: "<empty>"}")
+                }
+                try {
+                    objectMapper.readValue(raw, VkUploadResult::class.java)
+                } catch (e: Exception) {
+                    log.error("Cannot parse VkUploadResult ({}): {}", attempt, raw)
+                    throw IllegalStateException("Unexpected photo upload response", e)
+                }
+            }
         }
-        val multipart = LinkedMultiValueMap<String, Any>().apply { add("photo", resource) }
+    }
 
-        val uploadClient = RestClient.builder().baseUrl(uploadUrl).build()
-        val uploadResult = uploadClient.post()
-            .contentType(MediaType.MULTIPART_FORM_DATA)
-            .body(multipart)
-            .retrieve()
-            .body(VkUploadResult::class.java)
-            ?: error("Empty upload result (photo)")
-
+    private fun saveWallPhoto(uploadResult: VkUploadResult): String {
         val saved = retry.retry {
-            val form = LinkedMultiValueMap<String, String>().apply {
+            val form = org.springframework.util.LinkedMultiValueMap<String, String>().apply {
                 add("group_id", props.groupId.toString())
                 add("photo", uploadResult.photo)
                 add("server", uploadResult.server.toString())
@@ -106,7 +181,6 @@ class VkClient(
                 .retrieve()
                 .body(VkSaveWallPhotoResponse::class.java)
         }
-
         saved?.error?.let { throw IllegalStateException("VK error ${it.errorCode}: ${it.errorMsg}") }
         val ph = saved?.response?.firstOrNull() ?: error("No photo in saveWallPhoto response")
         val attach = "photo${ph.ownerId}_${ph.id}"
@@ -114,7 +188,70 @@ class VkClient(
         return attach
     }
 
-    /** Видео → video{owner_id}_{video_id} (upload через OkHttp, чтобы не ловить 406) */
+    private fun ensureExt(name: String, ext: String): String {
+        val clean = name.ifBlank { "photo" }
+        val hasExt = clean.substringAfterLast('.', missingDelimiterValue = "").isNotBlank()
+        return if (hasExt) clean else clean + ext
+    }
+
+    private fun sha1(b: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-1").digest(b).joinToString("") { "%02x".format(it) }
+
+    private data class ImgInfo(
+        val width: Int, val height: Int,
+        val numComponents: Int, val colorSpace: String, val type: String
+    )
+
+    private fun probeImage(bytes: ByteArray): ImgInfo {
+        val img = javax.imageio.ImageIO.read(java.io.ByteArrayInputStream(bytes))
+            ?: return ImgInfo(0, 0, -1, "unreadable", "unknown")
+        val cm = img.colorModel
+        val cs = cm.colorSpace
+        val csName = when (cs.type) {
+            java.awt.color.ColorSpace.TYPE_RGB -> "RGB"
+            java.awt.color.ColorSpace.TYPE_CMYK -> "CMYK"
+            java.awt.color.ColorSpace.TYPE_GRAY -> "GRAY"
+            else -> "TYPE_${cs.type}"
+        }
+        return ImgInfo(
+            img.width, img.height, cm.numComponents, csName, when (img.type) {
+                java.awt.image.BufferedImage.TYPE_INT_RGB -> "INT_RGB"
+                java.awt.image.BufferedImage.TYPE_3BYTE_BGR -> "3BYTE_BGR"
+                java.awt.image.BufferedImage.TYPE_4BYTE_ABGR -> "4BYTE_ABGR"
+                else -> "TYPE_${img.type}"
+            }
+        )
+    }
+
+    private fun normalizeToSrgbJpeg(src: ByteArray): ByteArray {
+        val img = javax.imageio.ImageIO.read(java.io.ByteArrayInputStream(src))
+            ?: error("Unsupported/invalid image; cannot normalize to sRGB JPEG")
+
+        // приводим к RGB
+        val rgb = java.awt.image.BufferedImage(img.width, img.height, java.awt.image.BufferedImage.TYPE_INT_RGB)
+        val g = rgb.createGraphics()
+        try {
+            g.drawImage(img, 0, 0, null)
+        } finally {
+            g.dispose()
+        }
+
+        val baos = java.io.ByteArrayOutputStream()
+        val writers = javax.imageio.ImageIO.getImageWritersByFormatName("jpg")
+        val writer = writers.next()
+        try {
+            val ios = javax.imageio.ImageIO.createImageOutputStream(baos)
+            writer.output = ios
+            val iwp = writer.defaultWriteParam
+            writer.write(null, javax.imageio.IIOImage(rgb, null, null), iwp)
+            ios.close()
+        } finally {
+            writer.dispose()
+        }
+        return baos.toByteArray()
+    }
+
+
     private fun uploadVideo(bytes: ByteArray, fileName: String, message: String?): String {
         val saveResp = retry.retry {
             val form = LinkedMultiValueMap<String, String>().apply {
@@ -146,7 +283,7 @@ class VkClient(
 
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart("video_file", fileName, RequestBody.create(mediaType, bytes))
+            .addFormDataPart("video_file", fileName, bytes.toRequestBody(mediaType))
             .build()
 
         val request = Request.Builder()
