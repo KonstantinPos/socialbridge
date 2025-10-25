@@ -8,6 +8,8 @@ import jakarta.annotation.PostConstruct
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 @Service
 class TdLibRelayService(
@@ -19,24 +21,23 @@ class TdLibRelayService(
     private lateinit var client: SimpleTelegramClient
 
     private val sourceChatIds = ConcurrentHashMap.newKeySet<Long>()
-    private val activatedChatIds = ConcurrentHashMap.newKeySet<Long>() // чтобы не активировать повторно
-
-    // дедупликация апдейтов
+    private val activatedChatIds = ConcurrentHashMap.newKeySet<Long>()
     private val processed = ConcurrentHashMap.newKeySet<String>()
 
-    // что мы ждём докачать: fileId -> метаданные
     private data class Pending(
-        val type: String,             // "photo" | "video"
+        val type: String,
         val caption: String?,
         val filename: String
     )
 
     private val pending = ConcurrentHashMap<Int, Pending>()
 
-    // лёгкий рейт-лимит на отправку в Bot API
     @Volatile
     private var lastSendAt = 0L
     private val minDelayMs = 800L
+
+    // Периодический пинг чатов для поддержания активности
+    private val scheduler = Executors.newSingleThreadScheduledExecutor()
 
     @PostConstruct
     fun start() {
@@ -46,7 +47,7 @@ class TdLibRelayService(
         val factory = SimpleTelegramClientFactory()
         client = factory.builder(settings).build(AuthenticationSupplier.user(props.phoneNumber))
 
-        // ловим докачанные файлы и отправляем ботом
+        // Ловим дкоачанные файлы и отправляем ботом
         client.addUpdateHandler(TdApi.UpdateFile::class.java) { upd ->
             val f = upd.file
             val meta = pending[f.id] ?: return@addUpdateHandler
@@ -56,7 +57,6 @@ class TdLibRelayService(
 
             try {
                 val bytes = java.nio.file.Files.readAllBytes(java.nio.file.Path.of(local.path))
-                // маленькая задержка, чтобы не ловить 429
                 val now = System.currentTimeMillis()
                 val wait = (lastSendAt + minDelayMs) - now
                 if (wait > 0) Thread.sleep(wait)
@@ -70,20 +70,38 @@ class TdLibRelayService(
             } catch (e: Exception) {
                 log.warn("Failed to send ${meta.type}: ${e.message}")
             } finally {
-                pending.remove(f.id) // обязательно очищаем
+                pending.remove(f.id)
             }
         }
 
-        // новые сообщения из источников
+        // Новые сообщения из источников
         client.addUpdateHandler(TdApi.UpdateNewMessage::class.java) { upd ->
             handleMessage(upd.message)
         }
 
-        // подключаем все источники
+        // КРИТИЧНО: Подписка на обновления чатов
+        client.addUpdateHandler(TdApi.UpdateChatLastMessage::class.java) { upd ->
+            if (sourceChatIds.contains(upd.chatId)) {
+                log.debug("UpdateChatLastMessage for chatId={}", upd.chatId)
+                // Можно дополнительно обработать, если нужно
+            }
+        }
+
+        // Подключаем все источники
         props.sources.forEach { src -> attachSource(src.trim()) }
+
+        // Периодически пингуем чаты каждые 5 минут для поддержания активности
+        scheduler.scheduleAtFixedRate({
+            sourceChatIds.forEach { chatId ->
+                try {
+                    refreshChat(chatId)
+                } catch (e: Exception) {
+                    log.warn("Failed to refresh chat {}: {}", chatId, e.message)
+                }
+            }
+        }, 5, 5, TimeUnit.MINUTES)
     }
 
-    /** Подключение к источнику: публичный @username или инвайт-ссылка */
     private fun attachSource(src: String) {
         when {
             src.startsWith("@") -> attachPublicByUsername(src)
@@ -92,7 +110,6 @@ class TdLibRelayService(
         }
     }
 
-    /** Публичный канал/группа по @username */
     private fun attachPublicByUsername(username: String) {
         client.send(TdApi.SearchPublicChat(username)) { res ->
             if (res.isError) {
@@ -107,7 +124,6 @@ class TdLibRelayService(
         }
     }
 
-    /** Присоединение по инвайт-ссылке t.me/+xxxx или t.me/joinchat/xxxx */
     private fun attachByInvite(link: String) {
         val invite = normalizeInviteLink(link)
 
@@ -115,7 +131,6 @@ class TdLibRelayService(
             when {
                 res.isError -> {
                     val e = res.error
-                    // Если уже участник - это нормально, просто логируем
                     if (e.code == 400 && e.message.contains("USER_ALREADY_PARTICIPANT")) {
                         log.info("TDLib: уже участник чата по инвайту {}, ищем chatId...", invite)
                         getChatIdFromInvite(invite)
@@ -137,7 +152,6 @@ class TdLibRelayService(
         }
     }
 
-    /** Получение chatId из invite-ссылки через CheckChatInviteLink */
     private fun getChatIdFromInvite(invite: String) {
         client.send(TdApi.CheckChatInviteLink(invite)) { res ->
             if (res.isError) {
@@ -159,15 +173,22 @@ class TdLibRelayService(
         }
     }
 
-    /** Явная активация чата, чтобы TDLib начал присылать UpdateNewMessage без ручного открытия чата */
     private fun activateChat(chatId: Long) {
         if (!activatedChatIds.add(chatId)) {
-            // уже активирован
             return
         }
 
-        // 1) Лёгкий пинг истории — этого достаточно, чтобы TDLib начал слать апдейты
-        client.send(TdApi.GetChatHistory(chatId, 0, 0, /*limit*/ 1, /*onlyLocal*/ false)) { res ->
+        // 1) Открываем чат явно
+        client.send(TdApi.OpenChat(chatId)) { res ->
+            if (res.isError) {
+                log.warn("TDLib: OpenChat error chatId {}: {} {}", chatId, res.error.code, res.error.message)
+            } else {
+                log.debug("TDLib: OpenChat ok chatId {}", chatId)
+            }
+        }
+
+        // 2) Загружаем последнее сообщение
+        client.send(TdApi.GetChatHistory(chatId, 0, 0, 1, false)) { res ->
             if (res.isError) {
                 log.warn("TDLib: GetChatHistory error chatId {}: {} {}", chatId, res.error.code, res.error.message)
             } else {
@@ -175,7 +196,7 @@ class TdLibRelayService(
             }
         }
 
-        // 2) (Необязательно) Пометить как просмотренные — оставим, но именно GetChatHistory критичен
+        // 3) Помечаем как просмотренные (опционально)
         client.send(TdApi.ViewMessages(chatId, longArrayOf(), null, true)) { res ->
             if (res.isError) {
                 log.debug("TDLib: ViewMessages warn chatId {}: {} {}", chatId, res.error.code, res.error.message)
@@ -183,10 +204,19 @@ class TdLibRelayService(
         }
     }
 
-    /** Обработка сообщения: берём текст/подпись/медиа и шлём в целевой канал */
+    // Периодическое обновление чата для поддержания активности
+    private fun refreshChat(chatId: Long) {
+        client.send(TdApi.GetChat(chatId)) { res ->
+            if (res.isError) {
+                log.debug("TDLib: GetChat refresh error chatId {}: {}", chatId, res.error.message)
+            } else {
+                log.trace("TDLib: Chat {} refreshed", chatId)
+            }
+        }
+    }
+
     private fun handleMessage(m: TdApi.Message) {
         if (!sourceChatIds.contains(m.chatId)) return
-        // if (m.isOutgoing) return // при желании
 
         val key = "${m.chatId}:${m.id}"
         if (!processed.add(key)) return
@@ -220,7 +250,7 @@ class TdLibRelayService(
             }
 
             else -> {
-                // при желании: добавить Document/Animation/Voice и т.п.
+                // При желании: добавить Document/Animation/Voice и т.п.
             }
         }
     }
