@@ -17,7 +17,9 @@ class TdLibRelayService(
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
     private lateinit var client: SimpleTelegramClient
+
     private val sourceChatIds = ConcurrentHashMap.newKeySet<Long>()
+    private val activatedChatIds = ConcurrentHashMap.newKeySet<Long>() // чтобы не активировать повторно
 
     // дедупликация апдейтов
     private val processed = ConcurrentHashMap.newKeySet<String>()
@@ -39,10 +41,12 @@ class TdLibRelayService(
     @PostConstruct
     fun start() {
         if (!props.enabled) return
+
         val settings = TDLibSettings.create(APIToken(props.apiId, props.apiHash))
         val factory = SimpleTelegramClientFactory()
         client = factory.builder(settings).build(AuthenticationSupplier.user(props.phoneNumber))
 
+        // ловим докачанные файлы и отправляем ботом
         client.addUpdateHandler(TdApi.UpdateFile::class.java) { upd ->
             val f = upd.file
             val meta = pending[f.id] ?: return@addUpdateHandler
@@ -50,7 +54,6 @@ class TdLibRelayService(
             val local = f.local
             if (!local.isDownloadingCompleted || local.path.isNullOrBlank()) return@addUpdateHandler
 
-            // готово: читаем файл и шлём ботом
             try {
                 val bytes = java.nio.file.Files.readAllBytes(java.nio.file.Path.of(local.path))
                 // маленькая задержка, чтобы не ловить 429
@@ -71,11 +74,12 @@ class TdLibRelayService(
             }
         }
 
-
+        // новые сообщения из источников
         client.addUpdateHandler(TdApi.UpdateNewMessage::class.java) { upd ->
             handleMessage(upd.message)
         }
 
+        // подключаем все источники
         props.sources.forEach { src -> attachSource(src.trim()) }
     }
 
@@ -97,9 +101,8 @@ class TdLibRelayService(
                 return@send
             }
             val chat = res.get()
-            // запоминаем id источника
             sourceChatIds.add(chat.id)
-            client.send(TdApi.ViewMessages(chat.id, longArrayOf(), null, true))
+            activateChat(chat.id)
             log.info("TDLib: слушаем публичный источник {} (chatId={})", username, chat.id)
         }
     }
@@ -115,7 +118,6 @@ class TdLibRelayService(
                     // Если уже участник - это нормально, просто логируем
                     if (e.code == 400 && e.message.contains("USER_ALREADY_PARTICIPANT")) {
                         log.info("TDLib: уже участник чата по инвайту {}, ищем chatId...", invite)
-                        // Пытаемся получить информацию о чате
                         getChatIdFromInvite(invite)
                     } else {
                         log.warn(
@@ -128,8 +130,8 @@ class TdLibRelayService(
                 else -> {
                     val chat = res.get()
                     sourceChatIds.add(chat.id)
+                    activateChat(chat.id)
                     log.info("TDLib: присоединились к чату по инвайту (chatId={})", chat.id)
-                    client.send(TdApi.ViewMessages(chat.id, longArrayOf(), null, true))
                 }
             }
         }
@@ -149,15 +151,38 @@ class TdLibRelayService(
             val info = res.get()
             if (info.chatId != 0L) {
                 sourceChatIds.add(info.chatId)
+                activateChat(info.chatId)
                 log.info("TDLib: добавлен чат из инвайта (chatId={})", info.chatId)
-                client.send(TdApi.ViewMessages(info.chatId, longArrayOf(), null, true))
             } else {
                 log.warn("TDLib: не удалось получить chatId из инвайта {}", invite)
             }
         }
     }
 
-    /** Обработка сообщения: берём текст/подпись, заменяем ссылки, отправляем в вашу TG-группу */
+    /** Явная активация чата, чтобы TDLib начал присылать UpdateNewMessage без ручного открытия чата */
+    private fun activateChat(chatId: Long) {
+        if (!activatedChatIds.add(chatId)) {
+            // уже активирован
+            return
+        }
+
+        // 1) Лёгкий пинг истории — этого достаточно, чтобы TDLib начал слать апдейты
+        client.send(TdApi.GetChatHistory(chatId, 0, 0, /*limit*/ 1, /*onlyLocal*/ false)) { res ->
+            if (res.isError) {
+                log.warn("TDLib: GetChatHistory error chatId {}: {} {}", chatId, res.error.code, res.error.message)
+            } else {
+                log.debug("TDLib: GetChatHistory ok chatId {}", chatId)
+            }
+        }
+
+        // 2) (Необязательно) Пометить как просмотренные — оставим, но именно GetChatHistory критичен
+        client.send(TdApi.ViewMessages(chatId, longArrayOf(), null, true)) { res ->
+            if (res.isError) {
+                log.debug("TDLib: ViewMessages warn chatId {}: {} {}", chatId, res.error.code, res.error.message)
+            }
+        }
+    }
+
     /** Обработка сообщения: берём текст/подпись/медиа и шлём в целевой канал */
     private fun handleMessage(m: TdApi.Message) {
         if (!sourceChatIds.contains(m.chatId)) return
@@ -173,8 +198,7 @@ class TdLibRelayService(
 
             is TdApi.MessagePhoto -> {
                 val photoFile = c.photo.sizes.lastOrNull()?.photo ?: return
-                val caption = transformer.transform(c.caption?.text) // ⟵ добавили
-                // регистрируем ожидание и просим TDLib докачать
+                val caption = transformer.transform(c.caption?.text)
                 pending[photoFile.id] = Pending(
                     type = "photo",
                     caption = caption,
@@ -185,7 +209,7 @@ class TdLibRelayService(
 
             is TdApi.MessageVideo -> {
                 val videoFile = c.video.video
-                val caption = transformer.transform(c.caption?.text) // ⟵ добавили
+                val caption = transformer.transform(c.caption?.text)
                 val name = if (!c.video.fileName.isNullOrBlank()) c.video.fileName else "video.mp4"
                 pending[videoFile.id] = Pending(
                     type = "video",
@@ -200,7 +224,6 @@ class TdLibRelayService(
             }
         }
     }
-
 
     private fun isInviteLink(s: String): Boolean {
         val low = s.lowercase()
