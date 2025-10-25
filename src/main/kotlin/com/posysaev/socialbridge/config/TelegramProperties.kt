@@ -8,5 +8,6 @@ data class TelegramProperties(
     var sourceChatIds: Set<Long>,
     var timeoutSec: Int,
     var pollingIntervalMs: Long,
-    var baseUrl: String
+    var baseUrl: String,
+    var targetChatId: Long
 )

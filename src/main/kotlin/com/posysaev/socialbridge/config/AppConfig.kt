@@ -5,6 +5,6 @@ import org.springframework.context.annotation.Configuration
 
 @Configuration
 @EnableConfigurationProperties(
-    value = [TelegramProperties::class, VkProperties::class]
+    value = [TelegramProperties::class, VkProperties::class, TdlibProperties::class]
 )
 class AppConfig

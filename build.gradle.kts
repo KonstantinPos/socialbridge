@@ -17,11 +17,30 @@ java {
 
 repositories {
 	mavenCentral()
+	maven("https://mvn.mchv.eu/repository/mchv/")
 }
 
 dependencies {
+	testImplementation(kotlin("test"))
+
+	implementation(platform("it.tdlight:tdlight-java-bom:3.4.0+td.1.8.26"))
+	implementation("it.tdlight:tdlight-java")
+	implementation("it.tdlight:tdlight-natives") {
+		artifact {
+			classifier = "windows_amd64"
+		}
+	}
+	implementation("it.tdlight:tdlight-natives") {
+		artifact {
+			classifier = "linux_amd64_gnu_ssl3"
+		}
+	}
+
+
+	// Existing dependencies
 	implementation("com.squareup.okhttp3:okhttp:4.12.0")
 	implementation("org.springframework.boot:spring-boot-starter-web")
+	implementation("org.jsoup:jsoup:1.16.1")
 	implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
 	implementation("org.jetbrains.kotlin:kotlin-reflect")
 	testImplementation("org.springframework.boot:spring-boot-starter-test")

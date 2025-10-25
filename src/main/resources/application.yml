@@ -3,14 +3,30 @@ spring:
     name: post-relay
 
 server:
-  port: 8081
+  port: 8082
 
+#-1003162514413  https://t.me/test_poling
+#-1002656029749  https://t.me/skidki_shop_tg
+#-1003060223157  https://t.me/videl_na_ali
 telegram:
   bot-token:
   source-chat-ids: -1003162514413, -1002656029749
   polling-interval-ms: 30000
   timeout-sec: 25
   base-url: "https://api.telegram.org"
+  target-chat-id: -1003060223157
+
+telegram-tdlib:
+  enabled: true
+  api-id: 29786173
+  api-hash:
+  phone-number: "+79856848399"
+  sources:
+    #-- мужское али
+            - "https://t.me/+zKAzhEG_5m5jMDhi"
+    #-- test_forwarding bydfqn
+#    - "https://t.me/+4sHC7s92FbQ1NDU6"
+#    - "@test_forwarding"
 
 vk:
   user-access-token:
@@ -20,6 +36,7 @@ vk:
 
 logging:
   level:
+    it.tdlight: ERROR
     com:
       posysaev:
         socialbridge: INFO
