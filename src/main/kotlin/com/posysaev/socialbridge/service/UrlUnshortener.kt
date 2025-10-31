@@ -70,9 +70,3 @@ class UrlUnshortener {
         return url
     }
 }
-
-@Component
-// простая заглушка: пока возвращаем как есть (сюда вставите вашу партнёрку)
-class AffiliateLinkBuilder {
-    fun build(resolvedProductUrl: String): String = resolvedProductUrl
-}

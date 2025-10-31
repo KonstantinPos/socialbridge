@@ -11,43 +11,50 @@ class LinkTransformer(
     private val tail = "Видел на Али 👀"
     private val tailLineRegex = Regex("""(?m)^\s*Видел на Али 👀\s*$""")
 
+    private fun escapeHtml(s: String) = buildString(s.length) {
+        for (ch in s) when (ch) {
+            '<' -> append("&lt;")
+            '>' -> append("&gt;")
+            '&' -> append("&amp;")
+            '"' -> append("&quot;")
+            '\'' -> append("&#39;")
+            else -> append(ch)
+        }
+    }
+
     fun transform(text: String?): String? {
-        // Если совсем пусто — всё равно вернём хвост:
         if (text.isNullOrBlank()) return tail
 
         var result = text
+        var marking: String? = null
 
-        // 1) Обработка ссылок (распаковать + обернуть партнёркой)
+        // 1) распаковать и заменить ссылки; параллельно забираем маркировку
         result = urlRegex.replace(result) { mr ->
-            val final = unshortener.resolve(mr.value)
-            builder.build(final)
+            val original = unshortener.resolve(mr.value)
+            val affiliate = builder.build(original)
+            builder.takeMarkingFor(original)?.let { marking = it }
+            affiliate
         }
 
-        // 2) Удаляем исходные подписи-брендинг источника
-        // (дальше сами добавим нужный хвост в конец)
+        // 2) почистить мусор
         result = result
             .replace("Мужской AliExpress 💪", "")
             .replace("Мужской AliExpress", "")
+            .replace(tailLineRegex, "")
+            .trim()
+            .replace(Regex("\n{3,}"), "\n\n")
 
-        // 3) Удаляем все существующие экземпляры хвоста в любом месте,
-        // чтобы не было дублей
-        result = result.replace(tailLineRegex, "")
-
-        // 4) Чистим лишние пробелы/пустые строки
-        result = result.trim()
-        result = result.replace(Regex("\\n{3,}"), "\n\n")
-
-        // 5) Гарантируем хвост в конце, с пустой строкой перед ним
+        // 3) добавить хвост
         result = if (result.isBlank()) {
             tail
         } else {
-            // Если вдруг хвост оказался на той же строке — отделяем
-            val needsGap = !result.endsWith("\n\n")
-            buildString(result.length + tail.length + 2) {
-                append(result!!.trimEnd())
-                if (needsGap) append("\n\n")
-                append(tail)
-            }
+            result.trimEnd() + "\n\n" + tail
+        }
+
+        // 4) добавить в конце цитату с маркировкой (без заголовка «Маркировка»)
+        marking?.let {
+            val html = "<blockquote>${escapeHtml(it)}</blockquote>"
+            result += "\n\n$html"
         }
 
         return result
