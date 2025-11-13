@@ -1,8 +1,10 @@
+// file: src/main/kotlin/com/posysaev/socialbridge/service/PollingService.kt
 package com.posysaev.socialbridge.service
 
 import com.posysaev.socialbridge.client.telegram.TelegramClient
 import com.posysaev.socialbridge.client.vkontakte.VkClient
 import com.posysaev.socialbridge.config.TelegramProperties
+import com.posysaev.socialbridge.config.VkProperties
 import com.posysaev.socialbridge.dto.telegram.TgMessageEntity
 import com.posysaev.socialbridge.dto.telegram.TgUpdate
 import com.posysaev.socialbridge.dto.vk.MixedAlbum
@@ -21,15 +23,20 @@ import kotlin.math.max
 class PollingService(
     private val tg: TelegramClient,
     private val vk: VkClient,
-    private val tgProps: TelegramProperties
+    private val tgProps: TelegramProperties,
+    private val vkProps: VkProperties, // добавили для маршрутов
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
     private val lastUpdateId = AtomicLong(0L)
     private val processedMessages = mutableSetOf<String>()
 
-    /** Буфер по media_group_id для альбомов (теперь хранит и фото, и видео) */
+    /** Буфер по media_group_id для альбомов (хранит и фото, и видео) */
     private val albums = ConcurrentHashMap<String, MixedAlbum>()
     private val albumBufferMs = 2500L
+
+    /** Определение целевой VK-группы по id чата TG, иначе — дефолтный props.groupId */
+    private fun targetGroupIdFor(tgChatId: Long): Long =
+        vkProps.routeMap[tgChatId] ?: vkProps.groupId
 
     @Scheduled(fixedDelayString = "\${telegram.polling-interval-ms:5000}")
     fun poll() {
@@ -67,7 +74,9 @@ class PollingService(
         }
         val text = expandTextLinks(rawText, ents)
 
-        // === часть media_group (может быть фото или видео)
+        val vkGroup = targetGroupIdFor(msg.chat.id)
+
+        // === альбом (может быть фото и/или видео) ===
         msg.mediaGroupId?.let { gid ->
             val album = albums.computeIfAbsent(gid) { MixedAlbum(msg.chat.id, System.currentTimeMillis()) }
             album.caption = album.caption ?: text
@@ -86,7 +95,7 @@ class PollingService(
             val path = tg.getFile(v.fileId).result.filePath ?: return
             val bytes = tg.downloadFileBytes(path)
             val fileName = path.substringAfterLast('/')
-            vk.post(text, listOf(VkMedia.Video(bytes, fileName)))
+            vk.post(text, listOf(VkMedia.Video(bytes, fileName)), vkGroup)
             return
         }
 
@@ -95,15 +104,15 @@ class PollingService(
             val path = tg.getFile(p.fileId).result.filePath ?: return
             val bytes = tg.downloadFileBytes(path)
             val fileName = path.substringAfterLast('/')
-            vk.post(text, listOf(VkMedia.Photo(bytes, fileName)))
+            vk.post(text, listOf(VkMedia.Photo(bytes, fileName)), vkGroup)
             return
         }
 
         // === просто текст ===
-        if (!text.isNullOrBlank()) vk.post(text)
+        if (!text.isNullOrBlank()) vk.post(text, groupId = vkGroup)
     }
 
-    /** Отправляет «созревшие» альбомы, где могли быть и фото, и видео. */
+    /** Отправляет «созревшие» альбомы (mix фото+видео). */
     private fun flushExpiredAlbums() {
         val now = System.currentTimeMillis()
         val ready = albums.filterValues { now - it.startedAt >= albumBufferMs }.toList()
@@ -117,7 +126,6 @@ class PollingService(
                             val name = path.substringAfterLast('/')
                             VkMedia.Photo(bytes, name)
                         }
-
                         is MixedMedia.Video -> {
                             val path = tg.getFile(m.fileId).result.filePath ?: return@mapNotNull null
                             val bytes = tg.downloadFileBytes(path)
@@ -128,8 +136,9 @@ class PollingService(
                 }
                 if (medias.isNotEmpty()) {
                     val caption = expandTextLinks(buf.caption, buf.captionEntities)
-                    vk.post(caption, medias)
-                    log.info("VK: posted mixed album {} ({} items)", gid, medias.size)
+                    val vkGroup = targetGroupIdFor(buf.chatId)
+                    vk.post(caption, medias, vkGroup)
+                    log.info("VK: posted mixed album {} ({} items) to group {}", gid, medias.size, vkGroup)
                 }
             } catch (e: Exception) {
                 log.error("Failed to post mixed album {}", gid, e)

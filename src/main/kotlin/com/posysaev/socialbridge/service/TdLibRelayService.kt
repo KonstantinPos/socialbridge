@@ -1,13 +1,18 @@
 package com.posysaev.socialbridge.service
 
 import com.posysaev.socialbridge.client.telegram.TelegramPublisher
+import com.posysaev.socialbridge.client.vkontakte.VkClient
 import com.posysaev.socialbridge.config.TdlibProperties
-import it.tdlight.client.*
+import com.posysaev.socialbridge.config.VkProperties
+import com.posysaev.socialbridge.dto.vk.VkMedia
+import it.tdlight.client.SimpleTelegramClient
 import it.tdlight.jni.TdApi
 import jakarta.annotation.PostConstruct
 import org.slf4j.LoggerFactory
 import org.springframework.context.annotation.Lazy
 import org.springframework.stereotype.Service
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -18,7 +23,9 @@ class TdLibRelayService(
     private val publisher: TelegramPublisher,
     private val client: SimpleTelegramClient,
     private val transformer: LinkTransformer,
-    @Lazy private val affiliateLinkBuilder: AffiliateLinkBuilder
+    @Lazy private val affiliateLinkBuilder: AffiliateLinkBuilder,
+    private val vk: VkClient,
+    private val vkProps: VkProperties
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
@@ -26,30 +33,41 @@ class TdLibRelayService(
     private val activatedChatIds = ConcurrentHashMap.newKeySet<Long>()
     private val processed = ConcurrentHashMap.newKeySet<String>()
 
+    // Строка, которую ВСЕГДА добавляем в конец текста для VK
+    private val VK_MARKING = "Реклама. ООО \"АЛИБАБА.КОМ (РУ)\" ИНН 7703380158"
+
+    private fun ensureVkMarking(text: String?): String {
+        val base = text?.trim() ?: ""
+        // если уже есть слово "Реклама" — не дублируем
+        return if (base.contains("Реклама")) base
+        else listOf(base, VK_MARKING).filter { it.isNotBlank() }.joinToString("\n\n")
+    }
+
     private data class Pending(
-        val type: String,
-        val caption: String?,
+        val type: String,           // "photo" | "video"
+        val captionTg: String?,
+        val captionVk: String?,
         val filename: String
     )
 
     private val pending = ConcurrentHashMap<Int, Pending>()
 
-    @Volatile
-    private var lastSendAt = 0L
+    @Volatile private var lastSendAt = 0L
     private val minDelayMs = 800L
 
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
-
-    // NEW: отдельный рабочий пул, чтобы не блокировать TDLib-поток
     private val worker = Executors.newFixedThreadPool(2)
 
     private val EPN_BOT_USERNAME = "epnWebmasterbot"
+
+    private val targetTgChatId: Long get() = props.targetChatId
+    private fun vkGroupForTarget(): Long = vkProps.routeMap[targetTgChatId] ?: vkProps.groupId
 
     @PostConstruct
     fun start() {
         if (!props.enabled) return
 
-        // Ловим докачанные файлы
+        // Когда TDLib докачал файл — публикуем в TG и зеркалим в VK
         client.addUpdateHandler(TdApi.UpdateFile::class.java) { upd ->
             val f = upd.file
             val meta = pending[f.id] ?: return@addUpdateHandler
@@ -58,57 +76,49 @@ class TdLibRelayService(
             if (!local.isDownloadingCompleted || local.path.isNullOrBlank()) return@addUpdateHandler
 
             try {
-                val bytes = java.nio.file.Files.readAllBytes(java.nio.file.Path.of(local.path))
+                val bytes = Files.readAllBytes(Path.of(local.path))
                 val now = System.currentTimeMillis()
                 val wait = (lastSendAt + minDelayMs) - now
                 if (wait > 0) Thread.sleep(wait)
 
                 when (meta.type) {
-                    "photo" -> publisher.sendPhoto(bytes, meta.filename, meta.caption)
-                    "video" -> publisher.sendVideo(bytes, meta.filename, meta.caption)
+                    "photo" -> {
+                        // TG — с HTML
+                        publisher.sendPhoto(bytes, meta.filename, meta.captionTg)
+                        // VK — без HTML + гарантированная маркировка
+                        val vkText = ensureVkMarking(meta.captionVk)
+                        vk.post(vkText, listOf(VkMedia.Photo(bytes, meta.filename)), vkGroupForTarget())
+                    }
+                    "video" -> {
+                        publisher.sendVideo(bytes, meta.filename, meta.captionTg)
+                        val vkText = ensureVkMarking(meta.captionVk)
+                        vk.post(vkText, listOf(VkMedia.Video(bytes, meta.filename)), vkGroupForTarget())
+                    }
                 }
                 lastSendAt = System.currentTimeMillis()
-                log.debug("Relayed ${meta.type} from path {}", local.path)
             } catch (e: Exception) {
-                log.warn("Failed to send ${meta.type}: ${e.message}")
+                log.warn("Failed to relay ${meta.type}: ${e.message}")
             } finally {
                 pending.remove(f.id)
             }
         }
 
-        // Новые сообщения — отправляем в рабочий пул
         client.addUpdateHandler(TdApi.UpdateNewMessage::class.java) { upd ->
             worker.execute { handleMessage(upd.message) }
         }
 
-        client.addUpdateHandler(TdApi.UpdateChatLastMessage::class.java) { upd ->
-            if (sourceChatIds.contains(upd.chatId)) {
-                log.debug("UpdateChatLastMessage for chatId={}", upd.chatId)
-            }
-        }
-
-        // Подключаем источники
+        // источники из настроек
         props.sources.forEach { src -> attachSource(src.trim()) }
 
-        // NEW: один раз резолвим chatId бота и сохраняем в билдер
+        // найти чат EPN-бота
         client.send(TdApi.SearchPublicChat(EPN_BOT_USERNAME)) { res ->
-            if (res.isError) {
-                log.warn("Не удалось найти @{}: {} {}", EPN_BOT_USERNAME, res.error.code, res.error.message)
-            } else {
-                val chatId = res.get().id
-                affiliateLinkBuilder.setEpnBotChatId(chatId)
-                log.info("EPN bot chatId resolved: {}", chatId)
-            }
+            if (!res.isError) affiliateLinkBuilder.setEpnBotChatId(res.get().id)
         }
 
-        // Периодический пинг чатов
+        // пингуем чаты
         scheduler.scheduleAtFixedRate({
             sourceChatIds.forEach { chatId ->
-                try {
-                    refreshChat(chatId)
-                } catch (e: Exception) {
-                    log.warn("Failed to refresh chat {}: {}", chatId, e.message)
-                }
+                try { refreshChat(chatId) } catch (_: Exception) {}
             }
         }, 5, 5, TimeUnit.MINUTES)
     }
@@ -123,111 +133,56 @@ class TdLibRelayService(
 
     private fun attachPublicByUsername(username: String) {
         client.send(TdApi.SearchPublicChat(username)) { res ->
-            if (res.isError) {
-                val e = res.error
-                log.warn("TDLib: source {} не найден: {} {}", username, e.code, e.message)
-                return@send
-            }
+            if (res.isError) return@send
             val chat = res.get()
             sourceChatIds.add(chat.id)
             activateChat(chat.id)
-            log.info("TDLib: слушаем публичный источник {} (chatId={})", username, chat.id)
         }
     }
 
     private fun attachByInvite(link: String) {
         val invite = normalizeInviteLink(link)
-
         client.send(TdApi.JoinChatByInviteLink(invite)) { res ->
-            when {
-                res.isError -> {
-                    val e = res.error
-                    if (e.code == 400 && e.message.contains("USER_ALREADY_PARTICIPANT")) {
-                        log.info("TDLib: уже участник чата по инвайту {}", invite)
-                        getChatIdFromInvite(invite)
-                    } else {
-                        log.warn("TDLib: не удалось присоединиться по инвайту {}: {} {}",
-                            invite, e.code, e.message)
-                    }
+            if (res.isError) {
+                if (res.error.code == 400 && res.error.message.contains("USER_ALREADY_PARTICIPANT")) {
+                    getChatIdFromInvite(invite)
                 }
-                else -> {
-                    val chat = res.get()
-                    sourceChatIds.add(chat.id)
-                    activateChat(chat.id)
-                    log.info("TDLib: присоединились к чату по инвайту (chatId={})", chat.id)
-                }
+            } else {
+                val chat = res.get()
+                sourceChatIds.add(chat.id)
+                activateChat(chat.id)
             }
         }
     }
 
     private fun getChatIdFromInvite(invite: String) {
         client.send(TdApi.CheckChatInviteLink(invite)) { res ->
-            if (res.isError) {
-                log.warn("TDLib: не удалось получить информацию о чате: {} {}",
-                    res.error.code, res.error.message)
-                return@send
-            }
-
+            if (res.isError) return@send
             val info = res.get()
             if (info.chatId != 0L) {
                 sourceChatIds.add(info.chatId)
                 activateChat(info.chatId)
-                log.info("TDLib: добавлен чат из инвайта (chatId={})", info.chatId)
-            } else {
-                log.warn("TDLib: не удалось получить chatId из инвайта {}", invite)
             }
         }
     }
 
     private fun activateChat(chatId: Long) {
         if (!activatedChatIds.add(chatId)) return
-
-        client.send(TdApi.OpenChat(chatId)) { res ->
-            if (res.isError) {
-                log.warn("TDLib: OpenChat error chatId {}: {} {}",
-                    chatId, res.error.code, res.error.message)
-            } else {
-                log.debug("TDLib: OpenChat ok chatId {}", chatId)
-            }
-        }
-
-        client.send(TdApi.GetChatHistory(chatId, 0, 0, 1, false)) { res ->
-            if (res.isError) {
-                log.warn("TDLib: GetChatHistory error chatId {}: {} {}",
-                    chatId, res.error.code, res.error.message)
-            } else {
-                log.debug("TDLib: GetChatHistory ok chatId {}", chatId)
-            }
-        }
-
-        client.send(TdApi.ViewMessages(chatId, longArrayOf(), null, true)) { res ->
-            if (res.isError) {
-                log.debug("TDLib: ViewMessages warn chatId {}: {} {}",
-                    chatId, res.error.code, res.error.message)
-            }
-        }
+        client.send(TdApi.OpenChat(chatId)) { }
+        client.send(TdApi.GetChatHistory(chatId, 0, 0, 1, false)) { }
     }
 
     private fun refreshChat(chatId: Long) {
-        client.send(TdApi.GetChat(chatId)) { res ->
-            if (res.isError) {
-                log.debug("TDLib: GetChat refresh error chatId {}: {}",
-                    chatId, res.error.message)
-            } else {
-                log.trace("TDLib: Chat {} refreshed", chatId)
-            }
-        }
+        client.send(TdApi.GetChat(chatId)) { }
     }
 
     private fun handleMessage(m: TdApi.Message) {
-        // Сообщение от EPN бота — распарсим и разрулим ожидания
         val epnId = affiliateLinkBuilder.getEpnBotChatId()
         if (epnId != null && m.chatId == epnId) {
             affiliateLinkBuilder.processBotMessage(m)
             return
         }
 
-        // Обычная обработка сообщений из источников
         if (!sourceChatIds.contains(m.chatId)) return
 
         val key = "${m.chatId}:${m.id}"
@@ -235,15 +190,27 @@ class TdLibRelayService(
 
         when (val c = m.content) {
             is TdApi.MessageText -> {
-                transformer.transform(c.text.text)?.let { publisher.sendTextToTarget(it) }
+                val textForTg = transformer.transform(c.text.text, plain = false)
+                val textForVk = transformer.transform(c.text.text, plain = true)
+
+                if (!textForTg.isNullOrBlank()) {
+                    publisher.sendTextToTarget(textForTg)
+                }
+                if (!textForVk.isNullOrBlank()) {
+                    val vkText = ensureVkMarking(textForVk)
+                    vk.post(vkText, groupId = vkGroupForTarget())
+                }
             }
 
             is TdApi.MessagePhoto -> {
                 val photoFile = c.photo.sizes.lastOrNull()?.photo ?: return
-                val caption = transformer.transform(c.caption?.text)
+                val captionTg = transformer.transform(c.caption?.text, plain = false)
+                val captionVk = transformer.transform(c.caption?.text, plain = true)
+
                 pending[photoFile.id] = Pending(
                     type = "photo",
-                    caption = caption,
+                    captionTg = captionTg,
+                    captionVk = captionVk,
                     filename = "photo.jpg"
                 )
                 client.send(TdApi.DownloadFile(photoFile.id, 32, 0, 0, false)) { }
@@ -251,19 +218,20 @@ class TdLibRelayService(
 
             is TdApi.MessageVideo -> {
                 val videoFile = c.video.video
-                val caption = transformer.transform(c.caption?.text)
+                val captionTg = transformer.transform(c.caption?.text, plain = false)
+                val captionVk = transformer.transform(c.caption?.text, plain = true)
                 val name = if (!c.video.fileName.isNullOrBlank()) c.video.fileName else "video.mp4"
+
                 pending[videoFile.id] = Pending(
                     type = "video",
-                    caption = caption,
+                    captionTg = captionTg,
+                    captionVk = captionVk,
                     filename = name
                 )
                 client.send(TdApi.DownloadFile(videoFile.id, 32, 0, 0, false)) { }
             }
 
-            else -> {
-                // При желании: добавить Document/Animation/Voice
-            }
+            else -> { /* игнор остальных типов */ }
         }
     }
 
@@ -272,7 +240,6 @@ class TdLibRelayService(
         return low.contains("t.me/+") || low.contains("t.me/joinchat/")
     }
 
-    private fun normalizeInviteLink(s: String): String {
-        return if (s.startsWith("http://") || s.startsWith("https://")) s else "https://$s"
-    }
+    private fun normalizeInviteLink(s: String): String =
+        if (s.startsWith("http://") || s.startsWith("https://")) s else "https://$s"
 }

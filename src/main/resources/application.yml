@@ -10,7 +10,7 @@ server:
 #-1003060223157  https://t.me/videl_na_ali
 telegram:
   bot-token:
-  source-chat-ids: -1003162514413, -1002656029749
+  source-chat-ids: -1003162514413, -1002656029749, -1003060223157
   polling-interval-ms: 30000
   timeout-sec: 25
   base-url: "https://api.telegram.org"
@@ -27,12 +27,16 @@ telegram-tdlib:
     #-- test_forwarding bydfqn
 #    - "https://t.me/+4sHC7s92FbQ1NDU6"
 #    - "@test_forwarding"
+  target-chat-id: -1003060223157
 
 vk:
-  user-access-token:
+  user-access-token: vk1.a.A0wonlGD0B2EVXst-cB64gzM68X_6JTQRXBp1NHs85b2jeyJu6ncTT8fG1agToOwSyJWQUk4QCOaA5bI_C2CZCB2J2T8o_6T5Ob02_al8CaaTbxkJcY-KCiBVJTh6w6FTvLGLBxMegZOKYiYLy4F3_An14Hnj2p2RZaCC6UifS73HPuhDMIXQkEFJr3Y3PNa92GUjIMmj1MWlG3Wt43HGA
   group-id: 229831803
   api-version: "5.199"
   base-url: "https://api.vk.com/method"
+  routes:
+    - tg-chat-id: -1003060223157
+      group-id: 233626797
 
 logging:
   level:

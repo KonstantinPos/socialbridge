@@ -12,5 +12,6 @@ data class TdlibProperties(
     var code: String? = null,       // одноразовый код (опционально)
     var password: String? = null,   // cloud password, если включён (опц.)
     var dbDir: String? = null,      // директории TDLib (опц.)
-    var filesDir: String? = null
+    var filesDir: String? = null,
+    var targetChatId: Long = 0
 )

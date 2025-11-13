@@ -1,3 +1,4 @@
+// file: src/main/kotlin/com/posysaev/socialbridge/client/vkontakte/VkClient.kt
 package com.posysaev.socialbridge.client.vkontakte
 
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -18,6 +19,7 @@ import org.springframework.web.client.RestClient
 /**
  * Универсальный клиент для публикации во ВКонтакте:
  * - текст, фото (1+), видео (1+), микс фото+видео
+ * Теперь поддерживает параметрический groupId на вызов.
  */
 @Component
 class VkClient(
@@ -29,27 +31,33 @@ class VkClient(
     private val log = LoggerFactory.getLogger(javaClass)
     private val api = RestClient.builder().baseUrl("https://api.vk.com/method").build()
 
-    /** Универсальная публикация: один wall.post */
-    fun post(message: String?, media: List<VkMedia> = emptyList()) {
+    /** Универсальная публикация одним wall.post. groupId можно переопределить на вызов. */
+    fun post(message: String?, media: List<VkMedia> = emptyList(), groupId: Long? = null) {
+        val gid = groupId ?: props.groupId
+
         if (media.isEmpty()) {
-            postToWall(message, emptyList()); return
+            postToWall(gid, message, emptyList()); return
         }
 
         val attachments = buildList {
             // фото
-            media.filterIsInstance<VkMedia.Photo>().forEach { add(uploadPhoto(it.bytes, it.fileName)) }
+            media.filterIsInstance<VkMedia.Photo>().forEach {
+                add(uploadPhoto(gid, it.bytes, it.fileName))
+            }
             // видео
-            media.filterIsInstance<VkMedia.Video>().forEach { add(uploadVideo(it.bytes, it.fileName, message)) }
+            media.filterIsInstance<VkMedia.Video>().forEach {
+                add(uploadVideo(gid, it.bytes, it.fileName, message))
+            }
         }
 
-        postToWall(message, attachments)
+        postToWall(gid, message, attachments)
     }
 
-    private fun postToWall(message: String?, attachments: List<String>) {
+    private fun postToWall(gid: Long, message: String?, attachments: List<String>) {
         val resp = retry.retry {
             api.get().uri { b ->
                 b.path("/wall.post")
-                    .queryParam("owner_id", -props.groupId)
+                    .queryParam("owner_id", -gid)
                     .queryParam("from_group", 1)
                     .apply { if (!message.isNullOrBlank()) queryParam("message", message.take(4096)) }
                     .apply { if (attachments.isNotEmpty()) queryParam("attachments", attachments.joinToString(",")) }
@@ -59,20 +67,19 @@ class VkClient(
             }.retrieve().body(VkResponse::class.java)
         }
         resp?.error?.let { throw IllegalStateException("VK error ${it.errorCode}: ${it.errorMsg}") }
-        log.info("VK: post published (attachments: ${attachments.size})")
+        log.info("VK: post published to group {} (attachments: {})", gid, attachments.size)
     }
 
-
-    private fun uploadPhoto(bytes: ByteArray, fileName: String): String {
-        val uploadUrl = getPhotoUploadUrl()
+    private fun uploadPhoto(gid: Long, bytes: ByteArray, fileName: String): String {
+        val uploadUrl = getPhotoUploadUrl(gid)
 
         val firstTry = doVkPhotoUpload(uploadUrl, bytes, fileName, perCallSeconds = 90)
 
         if (firstTry.photo.isBlank()) {
             val info = probeImage(bytes)
             log.warn(
-                "VK upload returned empty 'photo'. Will try RGB re-encode. " +
-                        "file={}, info={}", fileName, info
+                "VK upload returned empty 'photo'. Will try RGB re-encode. file={}, info={}",
+                fileName, info
             )
 
             val fixedBytes = normalizeToSrgbJpeg(bytes)
@@ -85,17 +92,17 @@ class VkClient(
                             "server=${secondTry.server}, hash=${secondTry.hash}"
                 )
             }
-            return saveWallPhoto(secondTry)
+            return saveWallPhoto(gid, secondTry)
         }
 
-        return saveWallPhoto(firstTry)
+        return saveWallPhoto(gid, firstTry)
     }
 
-    private fun getPhotoUploadUrl(): String {
+    private fun getPhotoUploadUrl(gid: Long): String {
         val res = retry.retry {
             api.get().uri { b ->
                 b.path("/photos.getWallUploadServer")
-                    .queryParam("group_id", props.groupId)
+                    .queryParam("group_id", gid)
                     .queryParam("access_token", props.userAccessToken)
                     .queryParam("v", props.apiVersion)
                     .build()
@@ -153,7 +160,9 @@ class VkClient(
                 }
 
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException("VK photo upload failed: HTTP ${resp.code} ${resp.message}. Body: ${raw ?: "<empty>"}")
+                    throw IllegalStateException(
+                        "VK photo upload failed: HTTP ${resp.code} ${resp.message}. Body: ${raw ?: "<empty>"}"
+                    )
                 }
                 try {
                     objectMapper.readValue(raw, VkUploadResult::class.java)
@@ -165,10 +174,10 @@ class VkClient(
         }
     }
 
-    private fun saveWallPhoto(uploadResult: VkUploadResult): String {
+    private fun saveWallPhoto(gid: Long, uploadResult: VkUploadResult): String {
         val saved = retry.retry {
-            val form = org.springframework.util.LinkedMultiValueMap<String, String>().apply {
-                add("group_id", props.groupId.toString())
+            val form = LinkedMultiValueMap<String, String>().apply {
+                add("group_id", gid.toString())
                 add("photo", uploadResult.photo)
                 add("server", uploadResult.server.toString())
                 add("hash", uploadResult.hash)
@@ -184,8 +193,60 @@ class VkClient(
         saved?.error?.let { throw IllegalStateException("VK error ${it.errorCode}: ${it.errorMsg}") }
         val ph = saved?.response?.firstOrNull() ?: error("No photo in saveWallPhoto response")
         val attach = "photo${ph.ownerId}_${ph.id}"
-        log.info("VK: uploaded photo {}", attach)
+        log.info("VK: uploaded photo {} to group {}", attach, gid)
         return attach
+    }
+
+    private fun uploadVideo(gid: Long, bytes: ByteArray, fileName: String, message: String?): String {
+        val saveResp = retry.retry {
+            val form = LinkedMultiValueMap<String, String>().apply {
+                add("group_id", gid.toString())
+                val title = message?.lineSequence()?.firstOrNull()?.take(80)
+                    ?: fileName.substringBeforeLast('.', fileName)
+                add("name", title)
+                if (!message.isNullOrBlank()) add("description", message.take(4000))
+                add("wallpost", "0")
+                add("access_token", props.userAccessToken)
+                add("v", props.apiVersion)
+            }
+            api.post().uri("/video.save")
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(form)
+                .retrieve()
+                .body(VkVideoSaveResponse::class.java)
+                ?: error("Empty video.save response")
+        }
+        saveResp.error?.let { throw IllegalStateException("VK error ${it.errorCode}: ${it.errorMsg}") }
+        val uploadUrl = saveResp.response?.uploadUrl ?: error("No upload_url from video.save")
+
+        val mediaType = when {
+            fileName.endsWith(".mp4", true) -> "video/mp4"
+            fileName.endsWith(".mov", true) -> "video/quicktime"
+            fileName.endsWith(".mkv", true) -> "video/x-matroska"
+            else -> "application/octet-stream"
+        }.toMediaTypeOrNull()
+
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("video_file", fileName, bytes.toRequestBody(mediaType))
+            .build()
+
+        val request = Request.Builder()
+            .url(uploadUrl)
+            .post(body)
+            .header("Accept", "*/*")
+            .header("Connection", "keep-alive")
+            .header("User-Agent", "okhttp/4.12")
+            .build()
+
+        httpClient.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful) throw IllegalStateException("VK upload failed: HTTP ${resp.code} ${resp.message}")
+            val jsonStr = resp.body?.string() ?: error("Empty video upload result")
+            val upload = objectMapper.readValue(jsonStr, VkVideoUploadResult::class.java)
+            val attach = "video${upload.ownerId}_${upload.videoId}"
+            log.info("VK: uploaded video {} to group {}", attach, gid)
+            return attach
+        }
     }
 
     private fun ensureExt(name: String, ext: String): String {
@@ -249,58 +310,5 @@ class VkClient(
             writer.dispose()
         }
         return baos.toByteArray()
-    }
-
-
-    private fun uploadVideo(bytes: ByteArray, fileName: String, message: String?): String {
-        val saveResp = retry.retry {
-            val form = LinkedMultiValueMap<String, String>().apply {
-                add("group_id", props.groupId.toString())
-                val title = message?.lineSequence()?.firstOrNull()?.take(80)
-                    ?: fileName.substringBeforeLast('.', fileName)
-                add("name", title)
-                if (!message.isNullOrBlank()) add("description", message.take(4000))
-                add("wallpost", "0")
-                add("access_token", props.userAccessToken)
-                add("v", props.apiVersion)
-            }
-            api.post().uri("/video.save")
-                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .body(form)
-                .retrieve()
-                .body(VkVideoSaveResponse::class.java)
-                ?: error("Empty video.save response")
-        }
-        saveResp.error?.let { throw IllegalStateException("VK error ${it.errorCode}: ${it.errorMsg}") }
-        val uploadUrl = saveResp.response?.uploadUrl ?: error("No upload_url from video.save")
-
-        val mediaType = when {
-            fileName.endsWith(".mp4", true) -> "video/mp4"
-            fileName.endsWith(".mov", true) -> "video/quicktime"
-            fileName.endsWith(".mkv", true) -> "video/x-matroska"
-            else -> "application/octet-stream"
-        }.toMediaTypeOrNull()
-
-        val body = MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart("video_file", fileName, bytes.toRequestBody(mediaType))
-            .build()
-
-        val request = Request.Builder()
-            .url(uploadUrl)
-            .post(body)
-            .header("Accept", "*/*")
-            .header("Connection", "keep-alive")
-            .header("User-Agent", "okhttp/4.12")
-            .build()
-
-        httpClient.newCall(request).execute().use { resp ->
-            if (!resp.isSuccessful) throw IllegalStateException("VK upload failed: HTTP ${resp.code} ${resp.message}")
-            val jsonStr = resp.body?.string() ?: error("Empty video upload result")
-            val upload = objectMapper.readValue(jsonStr, VkVideoUploadResult::class.java)
-            val attach = "video${upload.ownerId}_${upload.videoId}"
-            log.info("VK: uploaded video {}", attach)
-            return attach
-        }
     }
 }

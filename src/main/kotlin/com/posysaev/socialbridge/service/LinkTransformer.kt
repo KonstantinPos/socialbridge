@@ -22,7 +22,7 @@ class LinkTransformer(
         }
     }
 
-    fun transform(text: String?): String? {
+    fun transform(text: String?, plain: Boolean = false): String? {
         if (text.isNullOrBlank()) return tail
 
         var result = text
@@ -53,8 +53,13 @@ class LinkTransformer(
 
         // 4) добавить в конце цитату с маркировкой (без заголовка «Маркировка»)
         marking?.let {
-            val html = "<blockquote>${escapeHtml(it)}</blockquote>"
-            result += "\n\n$html"
+            result += "\n\n" + if (plain) {
+                // VK: без HTML
+                "Реклама. ${it.trim()}"
+            } else {
+                // Telegram: HTML разрешён
+                "<blockquote>${escapeHtml(it)}</blockquote>"
+            }
         }
 
         return result
